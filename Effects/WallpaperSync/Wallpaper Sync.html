@@ -207,10 +207,13 @@
   }
 
   function render(now) {
+    var currentTime = (typeof now === "number" && now > 0) ? now : performance.now();
+
     // 1. Process Smooth Color Transition from Wallpaper Changes
     if (isTransitioning) {
-      var elapsed = now - transitionStartTime;
-      var t = Math.min(1.0, elapsed / transitionDurationMs);
+      var elapsed = currentTime - transitionStartTime;
+      var t = Math.min(1.0, Math.max(0.0, elapsed / transitionDurationMs));
+      if (isNaN(t)) { t = 1.0; }
       var eased = easeInOutCubic(t);
 
       currentColor.r = lerp(startColor.r, targetColor.r, eased);
@@ -236,7 +239,7 @@
     var s = applyAdjustments(currentSecondary);
     var activeMode = (typeof mode !== "undefined") ? mode : "Solid Dominant";
     var animSpeed = (typeof breathe_speed !== "undefined") ? breathe_speed / 35.0 : 1.0;
-    var secTime = (now * 0.001) * animSpeed;
+    var secTime = (currentTime * 0.001) * animSpeed;
 
     // 2. Render Selected Display Mode
     if (activeMode === "Solid Dominant") {

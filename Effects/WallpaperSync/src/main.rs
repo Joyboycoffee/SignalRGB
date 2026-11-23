@@ -6,14 +6,13 @@ use std::fs::File;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{exit, Command, Stdio};
+use std::process::{exit, Command};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 
 const SIGNALRGB_EVENT_PORT: u16 = 16034;
-const POLL_INTERVAL: Duration = Duration::from_millis(1000);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const SILENT_DAEMON_FLAGS: u32 = CREATE_NO_WINDOW;
 
 #[cfg(windows)]
 mod win_mem {
@@ -39,6 +38,104 @@ mod win_mem {
     pub fn trim_working_set() {}
 }
 
+#[cfg(windows)]
+mod win_reg {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    const HKEY_CURRENT_USER: usize = 0x80000001;
+    const KEY_READ: u32 = 0x20019;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            h_key: usize,
+            sub_key: *const u16,
+            options: u32,
+            sam_desired: u32,
+            phk_result: *mut usize,
+        ) -> i32;
+
+        fn RegQueryValueExW(
+            h_key: usize,
+            value_name: *const u16,
+            reserved: *mut u32,
+            type_: *mut u32,
+            data: *mut u8,
+            cb_data: *mut u32,
+        ) -> i32;
+
+        fn RegCloseKey(h_key: usize) -> i32;
+    }
+
+    /// Read the active wallpaper path from Windows Registry (HKCU\Control Panel\Desktop\TranscodedImageCache)
+    /// This updates immediately when Windows rotates wallpaper, even before disk transcoding completes.
+    pub fn get_transcoded_image_cache_path() -> Option<PathBuf> {
+        let sub_key: Vec<u16> = "Control Panel\\Desktop\0".encode_utf16().collect();
+        let val_name: Vec<u16> = "TranscodedImageCache\0".encode_utf16().collect();
+
+        let mut h_key: usize = 0;
+        unsafe {
+            if RegOpenKeyExW(HKEY_CURRENT_USER, sub_key.as_ptr(), 0, KEY_READ, &mut h_key) != 0 {
+                return None;
+            }
+
+            let mut len: u32 = 0;
+            if RegQueryValueExW(
+                h_key,
+                val_name.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut len,
+            ) != 0
+                || len < 26
+            {
+                RegCloseKey(h_key);
+                return None;
+            }
+
+            let mut buf = vec![0u8; len as usize];
+            if RegQueryValueExW(
+                h_key,
+                val_name.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                &mut len,
+            ) != 0
+            {
+                RegCloseKey(h_key);
+                return None;
+            }
+
+            RegCloseKey(h_key);
+
+            // TranscodedImageCache header is 24 bytes, followed by UTF-16LE null-terminated path
+            let path_bytes = &buf[24..];
+            let u16_slice: &[u16] =
+                std::slice::from_raw_parts(path_bytes.as_ptr() as *const u16, path_bytes.len() / 2);
+            let end_idx = u16_slice.iter().position(|&c| c == 0).unwrap_or(u16_slice.len());
+            let os_str = OsString::from_wide(&u16_slice[..end_idx]);
+            let path = PathBuf::from(os_str);
+            if path.exists() {
+                Some(path)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod win_reg {
+    use std::path::PathBuf;
+    pub fn get_transcoded_image_cache_path() -> Option<PathBuf> {
+        None
+    }
+}
+
 // Embed the complete HTML effect directly inside the compiled binary
 const EMBEDDED_EFFECT_HTML: &str = include_str!("../Wallpaper Sync.html");
 
@@ -49,6 +146,7 @@ struct RgbColor {
     b: u8,
 }
 
+#[derive(Debug, Clone, Copy)]
 struct DominantColors {
     primary: RgbColor,
     secondary: RgbColor,
@@ -211,7 +309,7 @@ fn extract_colors(img_bytes: &[u8]) -> Result<DominantColors, Box<dyn std::error
 
     let mut ranked_indices: Vec<usize> = (0..BANDS.len()).collect();
     ranked_indices.sort_by(|&a, &b| {
-        band_scores[b].total_score.partial_cmp(&band_scores[a].total_score).unwrap()
+        band_scores[b].total_score.partial_cmp(&band_scores[a].total_score).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let get_rep_color = |band_idx: usize| -> Option<RgbColor> {
@@ -220,7 +318,7 @@ fn extract_colors(img_bytes: &[u8]) -> Result<DominantColors, Box<dyn std::error
             return None;
         }
         let mut px = entry.pixels.clone();
-        px.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        px.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         let top_count = (px.len() / 5).max(5).min(px.len());
         let slice = &px[..top_count];
         let sum_r: u64 = slice.iter().map(|p| p.r as u64).sum();
@@ -291,14 +389,22 @@ fn compute_sample_hash(bytes: &[u8]) -> u64 {
 }
 
 fn get_active_wallpaper() -> Option<WallpaperSignature> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. Primary check: Exact original wallpaper path from Windows Registry cache
+    // This updates immediately on "Next desktop background" or slideshow transition
+    if let Some(reg_path) = win_reg::get_transcoded_image_cache_path() {
+        candidates.push(reg_path);
+    }
+
+    // 2. Candidate files in Themes directory
     let appdata = env::var("APPDATA").unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Roaming".to_string());
     let themes_dir = Path::new(&appdata).join("Microsoft").join("Windows").join("Themes");
 
-    // Check candidate files in priority order
-    let candidates = [
-        themes_dir.join("TranscodedWallpaper"),
-        themes_dir.join("Transcoded_000"),
-    ];
+    candidates.push(themes_dir.join("TranscodedWallpaper"));
+    candidates.push(themes_dir.join("Transcoded_000"));
+    candidates.push(themes_dir.join("Transcoded_001"));
+    candidates.push(themes_dir.join("Transcoded_002"));
 
     for path in &candidates {
         if path.exists() {
@@ -338,7 +444,7 @@ fn read_with_retry(path: &Path) -> Result<Vec<u8>, std::io::Error> {
             }
             Err(_) => {}
         }
-        sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(50));
     }
     std::fs::read(path)
 }
@@ -423,6 +529,20 @@ fn is_other_instance_running() -> bool {
     false
 }
 
+fn spawn_daemon() -> bool {
+    let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("signalrgb-wallpaper-sync.exe"));
+    let ps_cmd = format!(
+        "Start-Process -FilePath '{}' -ArgumentList '--daemon' -WindowStyle Hidden",
+        exe_path.display()
+    );
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_cmd])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+
+    status.map(|s| s.success()).unwrap_or(false)
+}
+
 fn cmd_install() {
     println!("============================================================");
     println!("  SignalRGB Wallpaper Sync - One-Click Installer");
@@ -468,17 +588,10 @@ fn cmd_install() {
     // 3. Start background daemon
     kill_other_instances();
     sleep(Duration::from_millis(400));
-    let spawn_res = Command::new(&exe_path)
-        .arg("--daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(SILENT_DAEMON_FLAGS)
-        .spawn();
-
-    match spawn_res {
-        Ok(child) => println!("[3/3] Started background sync daemon (PID {}).", child.id()),
-        Err(e) => eprintln!("[3/3] Could not spawn background daemon: {}", e),
+    if spawn_daemon() {
+        println!("[3/3] Started background sync daemon.");
+    } else {
+        eprintln!("[3/3] Could not spawn background daemon.");
     }
 
     println!("\nSUCCESS: SignalRGB Wallpaper Sync is installed and active!");
@@ -504,28 +617,10 @@ fn cmd_start() {
         println!("SignalRGB Wallpaper Sync daemon is already running.");
         return;
     }
-    let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("signalrgb-wallpaper-sync.exe"));
-    let res = Command::new(&exe_path)
-        .arg("--daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(SILENT_DAEMON_FLAGS)
-        .spawn();
-
-    match res {
-        Ok(child) => println!("[OK] Started background sync daemon (PID {}).", child.id()),
-        Err(_) => {
-            let ps_cmd = format!(
-                "Start-Process -FilePath '{}' -ArgumentList '--daemon' -WindowStyle Hidden",
-                exe_path.display()
-            );
-            let _ = Command::new("powershell")
-                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_cmd])
-                .creation_flags(CREATE_NO_WINDOW)
-                .status();
-            println!("[OK] Started background sync daemon.");
-        }
+    if spawn_daemon() {
+        println!("[OK] Started background sync daemon.");
+    } else {
+        eprintln!("[ERROR] Could not start background sync daemon.");
     }
 }
 
@@ -577,16 +672,20 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
     let mut last_sig: Option<WallpaperSignature> = None;
     let mut last_primary: Option<RgbColor> = None;
     let mut last_secondary: Option<RgbColor> = None;
+    let mut last_colors: Option<DominantColors> = None;
     let mut srgb_unreachable_count = 0u32;
+    let mut heartbeat_ticks = 0u32;
 
     loop {
+        heartbeat_ticks += 1;
+
         // In companion mode, auto-terminate if SignalRGB port is down for multiple consecutive cycles
         if is_companion {
             use std::net::{SocketAddr, TcpStream};
             let addr: SocketAddr = "127.0.0.1:16034".parse().unwrap();
             if TcpStream::connect_timeout(&addr, Duration::from_millis(80)).is_err() {
                 srgb_unreachable_count += 1;
-                if srgb_unreachable_count >= 4 {
+                if srgb_unreachable_count >= 12 {
                     // SignalRGB closed, cleanly terminate companion
                     exit(0);
                 }
@@ -602,7 +701,7 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
             };
 
             if signature_changed {
-                sleep(Duration::from_millis(100));
+                sleep(Duration::from_millis(50));
 
                 match read_with_retry(&sig.path) {
                     Ok(bytes) => match extract_colors(&bytes) {
@@ -612,6 +711,7 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
                                 _ => true,
                             };
 
+                            let mut push_success = false;
                             if colors_changed {
                                 let p = colors.primary;
                                 let s = colors.secondary;
@@ -635,6 +735,9 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
                                         }
                                         last_primary = Some(colors.primary);
                                         last_secondary = Some(colors.secondary);
+                                        last_colors = Some(colors);
+                                        push_success = true;
+                                        heartbeat_ticks = 0;
                                     }
                                     Err(e) => {
                                         if !is_daemon {
@@ -642,8 +745,15 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
                                         }
                                     }
                                 }
+                            } else {
+                                push_success = true;
                             }
-                            last_sig = Some(sig);
+
+                            // Only record signature as processed if we successfully notified SignalRGB
+                            // (or colors didn't change). If SignalRGB was unreachable, we will retry immediately!
+                            if push_success {
+                                last_sig = Some(sig);
+                            }
                         }
                         Err(e) => {
                             if !is_daemon {
@@ -656,6 +766,13 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
                             eprintln!("[ERROR] Reading wallpaper file failed: {}", e);
                         }
                     }
+                }
+            } else if heartbeat_ticks >= 16 {
+                // Heartbeat every ~4 seconds (16 ticks * 250ms)
+                // Ensures that if SignalRGB reloads the effect or starts up, the active colors are pushed
+                heartbeat_ticks = 0;
+                if let Some(ref colors) = last_colors {
+                    let _ = send_to_signalrgb(colors);
                 }
             }
         }
