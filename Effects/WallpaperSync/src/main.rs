@@ -449,6 +449,12 @@ fn read_with_retry(path: &Path) -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(path)
 }
 
+fn is_signalrgb_active() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let addr: SocketAddr = "127.0.0.1:16034".parse().unwrap();
+    TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok()
+}
+
 fn send_to_signalrgb(colors: &DominantColors) -> Result<(), Box<dyn std::error::Error>> {
     let p = colors.primary;
     let s = colors.secondary;
@@ -579,8 +585,18 @@ fn cmd_install() {
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
+    // Also register in HKCU\Software\Microsoft\Windows\CurrentVersion\Run alongside SignalRGB
+    let reg_cmd = format!(
+        "Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'SignalRGB-Wallpaper-Sync' -Value '\"{}\" --daemon'",
+        exe_path.display()
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &reg_cmd])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
     if res.is_ok() {
-        println!("[2/3] Configured Windows Startup shortcut (runs silently on boot).");
+        println!("[2/3] Configured Windows Startup & Run registry (runs silently on boot alongside SignalRGB).");
     } else {
         eprintln!("[2/3] WARNING: Could not register Windows Startup automatically.");
     }
@@ -609,6 +625,13 @@ fn cmd_uninstall() {
         println!("[OK] Removed Windows Startup shortcut.");
     }
 
+    let unreg_cmd = "Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'SignalRGB-Wallpaper-Sync' -ErrorAction SilentlyContinue";
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", unreg_cmd])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    println!("[OK] Removed Windows Run registry entry.");
+
     println!("Uninstallation complete.");
 }
 
@@ -634,10 +657,19 @@ fn cmd_status() {
     let effect_installed = get_signalrgb_effects_path().join("Wallpaper Sync.html").exists();
     let startup_configured = get_startup_shortcut_path().exists();
 
+    let reg_check_cmd = "(Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'SignalRGB-Wallpaper-Sync' -ErrorAction SilentlyContinue) -ne $null";
+    let reg_configured = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", reg_check_cmd])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "True")
+        .unwrap_or(false);
+
     println!("SignalRGB Wallpaper Sync Status:");
     println!("  Background Daemon Running : {}", if running { "YES" } else { "NO" });
     println!("  SignalRGB Effect Installed: {}", if effect_installed { "YES" } else { "NO" });
-    println!("  Windows Startup Registered: {}", if startup_configured { "YES" } else { "NO" });
+    println!("  Windows Startup Shortcut  : {}", if startup_configured { "YES" } else { "NO" });
+    println!("  Windows Registry Autostart: {}", if reg_configured { "YES" } else { "NO" });
 }
 
 fn print_help() {
@@ -675,15 +707,14 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
     let mut last_colors: Option<DominantColors> = None;
     let mut srgb_unreachable_count = 0u32;
     let mut heartbeat_ticks = 0u32;
+    let mut was_srgb_active = false;
 
     loop {
-        heartbeat_ticks += 1;
+        let srgb_active = is_signalrgb_active();
 
         // In companion mode, auto-terminate if SignalRGB port is down for multiple consecutive cycles
         if is_companion {
-            use std::net::{SocketAddr, TcpStream};
-            let addr: SocketAddr = "127.0.0.1:16034".parse().unwrap();
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(80)).is_err() {
+            if !srgb_active {
                 srgb_unreachable_count += 1;
                 if srgb_unreachable_count >= 12 {
                     // SignalRGB closed, cleanly terminate companion
@@ -693,6 +724,27 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
                 srgb_unreachable_count = 0;
             }
         }
+
+        // When SignalRGB is NOT active (and not companion auto-exiting):
+        // Idle peacefully with ultra-low resource consumption
+        if !srgb_active {
+            was_srgb_active = false;
+            win_mem::trim_working_set();
+            sleep(Duration::from_millis(1500));
+            continue;
+        }
+
+        // The exact moment SignalRGB turns ON (transition from inactive -> active):
+        // Force an instant detection and push so SignalRGB gets the wallpaper colors immediately!
+        if !was_srgb_active {
+            was_srgb_active = true;
+            last_sig = None;
+            if !is_daemon {
+                println!("[SignalRGB Connected] SignalRGB detected! Synchronizing wallpaper colors immediately...");
+            }
+        }
+
+        heartbeat_ticks += 1;
 
         if let Some(sig) = get_active_wallpaper() {
             let signature_changed = match &last_sig {
