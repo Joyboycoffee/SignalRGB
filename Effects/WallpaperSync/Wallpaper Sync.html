@@ -1,0 +1,325 @@
+<head>
+  <title>Wallpaper Sync</title>
+  <meta description="Smoothly synchronizes your RGB lights with your desktop wallpaper slideshow colors." />
+  <meta publisher="Gourav Kumar" />
+
+  <meta property="mode" label="Display Mode" type="combobox" values="Solid Dominant,Horizontal Gradient,Vertical Gradient,Diagonal Flow,Radial Gradient,Breathing Ambient,Dual Breathe,Color Wave,Ambient Drift" default="Solid Dominant" />
+  <meta property="transition_speed" label="Transition Duration (s)" type="number" min="0.5" max="10" default="2.0" />
+  <meta property="brightness" label="Brightness (%)" type="number" min="10" max="100" default="100" />
+  <meta property="saturation_boost" label="Saturation Boost (%)" type="number" min="0" max="100" default="15" />
+  <meta property="breathe_speed" label="Animation Speed" type="number" min="1" max="100" default="35" />
+</head>
+
+<body style="margin: 0; padding: 0; background: #000; overflow: hidden;">
+  <canvas id="exCanvas" width="320" height="200"></canvas>
+</body>
+
+<script>
+  console.log("[WallpaperSync] Effect script loaded and initialized!");
+
+  var canvas = document.getElementById("exCanvas");
+  var ctx = canvas.getContext("2d");
+  var width = canvas.width;
+  var height = canvas.height;
+
+  var currentColor = { r: 52, g: 152, b: 219 };
+  var startColor = { r: 52, g: 152, b: 219 };
+  var targetColor = { r: 52, g: 152, b: 219 };
+
+  var currentSecondary = { r: 155, g: 89, b: 182 };
+  var startSecondary = { r: 155, g: 89, b: 182 };
+  var targetSecondary = { r: 155, g: 89, b: 182 };
+
+  var transitionStartTime = 0;
+  var transitionDurationMs = 2000;
+  var isTransitioning = false;
+  var breathePhase = 0;
+
+  function safeParse(str) {
+    if (typeof str !== "string") return str;
+    try { str = decodeURIComponent(str); } catch(e) {}
+    try { return JSON.parse(str); } catch(e) {}
+    return str;
+  }
+
+  function onCanvasApiEvent(apiEvent) {
+    try {
+      console.log("[WallpaperSync] onCanvasApiEvent received: " + JSON.stringify(apiEvent));
+      var r = undefined, g = undefined, b = undefined;
+      var sec_r = undefined, sec_g = undefined, sec_b = undefined;
+
+      var ev = apiEvent ? (apiEvent.event || apiEvent["event"]) : "";
+
+      // 1. Check comma-separated string: "r,g,b,sec_r,sec_g,sec_b"
+      if (typeof ev === "string" && (ev.indexOf(",") !== -1 || ev.indexOf("_") !== -1)) {
+        var sep = ev.indexOf(",") !== -1 ? "," : "_";
+        var parts = ev.split(sep);
+        if (parts.length >= 3) {
+          r = parseInt(parts[0]);
+          g = parseInt(parts[1]);
+          b = parseInt(parts[2]);
+          if (parts.length >= 6) {
+            sec_r = parseInt(parts[3]);
+            sec_g = parseInt(parts[4]);
+            sec_b = parseInt(parts[5]);
+          }
+        }
+      }
+
+      // 2. Check Hex color: "ff6432" or "#ff6432"
+      if (r === undefined && typeof ev === "string" && (ev.length === 6 || (ev.length === 7 && ev[0] === "#"))) {
+        var cleanHex = ev.replace("#", "");
+        var parsedHex = parseInt(cleanHex, 16);
+        if (!isNaN(parsedHex)) {
+          r = (parsedHex >> 16) & 255;
+          g = (parsedHex >> 8) & 255;
+          b = parsedHex & 255;
+        }
+      }
+
+      // 3. Check JSON or Object payload
+      if (r === undefined) {
+        var obj = safeParse(ev);
+        if (obj && typeof obj === "object") {
+          if (obj.r !== undefined) {
+            r = parseInt(obj.r);
+            g = parseInt(obj.g);
+            b = parseInt(obj.b);
+            if (obj.secondary) {
+              sec_r = parseInt(obj.secondary.r);
+              sec_g = parseInt(obj.secondary.g);
+              sec_b = parseInt(obj.secondary.b);
+            }
+          }
+        }
+      }
+
+      // 4. Fallback: check direct properties on apiEvent
+      if (r === undefined && apiEvent && typeof apiEvent === "object") {
+        if (apiEvent.r !== undefined && apiEvent.g !== undefined && apiEvent.b !== undefined) {
+          r = parseInt(apiEvent.r);
+          g = parseInt(apiEvent.g);
+          b = parseInt(apiEvent.b);
+          if (apiEvent.sec_r !== undefined) {
+            sec_r = parseInt(apiEvent.sec_r);
+            sec_g = parseInt(apiEvent.sec_g);
+            sec_b = parseInt(apiEvent.sec_b);
+          }
+        }
+      }
+
+      if (r !== undefined && g !== undefined && b !== undefined && !isNaN(r) && !isNaN(g) && !isNaN(b)) {
+        var secObj = (sec_r !== undefined && !isNaN(sec_r)) ? { r: sec_r, g: sec_g, b: sec_b } : null;
+        console.log("[WallpaperSync] SUCCESS! Applying RGB(" + r + ", " + g + ", " + b + ")");
+        setNewColor(r, g, b, secObj);
+      } else {
+        console.log("[WallpaperSync] FAILED to extract RGB from: " + JSON.stringify(apiEvent));
+      }
+    } catch (err) {
+      console.log("[WallpaperSync] Exception in onCanvasApiEvent: " + err);
+    }
+  }
+
+  window.onCanvasApiEvent = onCanvasApiEvent;
+
+  function setNewColor(r, g, b, sec) {
+    startColor = { r: currentColor.r, g: currentColor.g, b: currentColor.b };
+    targetColor = { r: clamp(r, 0, 255), g: clamp(g, 0, 255), b: clamp(b, 0, 255) };
+
+    startSecondary = { r: currentSecondary.r, g: currentSecondary.g, b: currentSecondary.b };
+    if (sec && sec.r !== undefined && sec.g !== undefined && sec.b !== undefined) {
+      targetSecondary = { r: clamp(sec.r, 0, 255), g: clamp(sec.g, 0, 255), b: clamp(sec.b, 0, 255) };
+    } else {
+      targetSecondary = { r: targetColor.r, g: targetColor.g, b: targetColor.b };
+    }
+
+    transitionStartTime = performance.now();
+    var speed = (typeof transition_speed !== "undefined") ? transition_speed : 2.0;
+    transitionDurationMs = Math.max(200, speed * 1000);
+    isTransitioning = true;
+  }
+
+  function easeInOutCubic(x) {
+    return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+  }
+
+  function lerp(start, end, t) {
+    return start + (end - start) * t;
+  }
+
+  function clamp(val, min, max) {
+    return Math.max(min, Math.min(max, val));
+  }
+
+  function rgbToHsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    var max = Math.max(r, g, b), min = Math.min(r, g, b);
+    var h, s, l = (max + min) / 2;
+    if (max === min) {
+      h = s = 0;
+    } else {
+      var d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      switch (max) {
+        case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+        case g: h = (b - r) / d + 2; break;
+        case b: h = (r - g) / d + 4; break;
+      }
+      h /= 6;
+    }
+    return [h * 360, s * 100, l * 100];
+  }
+
+  function hslToRgb(h, s, l) {
+    h /= 360; s /= 100; l /= 100;
+    var r, g, b;
+    if (s === 0) {
+      r = g = b = l;
+    } else {
+      var hue2rgb = function(p, q, t) {
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1/6) return p + (q - p) * 6 * t;
+        if (t < 1/2) return q;
+        if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+        return p;
+      };
+      var q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+      var p = 2 * l - q;
+      r = hue2rgb(p, q, h + 1/3);
+      g = hue2rgb(p, q, h);
+      b = hue2rgb(p, q, h - 1/3);
+    }
+    return { r: Math.round(r * 255), g: Math.round(g * 255), b: Math.round(b * 255) };
+  }
+
+  function applyAdjustments(col) {
+    var hsl = rgbToHsl(col.r, col.g, col.b);
+    var h = hsl[0], s = hsl[1], l = hsl[2];
+
+    var boost = (typeof saturation_boost !== "undefined") ? saturation_boost : 15;
+    s = clamp(s + boost, 0, 100);
+
+    var bLevel = (typeof brightness !== "undefined") ? brightness / 100 : 1.0;
+    l = clamp(l * bLevel, 0, 100);
+
+    return hslToRgb(h, s, l);
+  }
+
+  function render(now) {
+    // 1. Process Smooth Color Transition from Wallpaper Changes
+    if (isTransitioning) {
+      var elapsed = now - transitionStartTime;
+      var t = Math.min(1.0, elapsed / transitionDurationMs);
+      var eased = easeInOutCubic(t);
+
+      currentColor.r = lerp(startColor.r, targetColor.r, eased);
+      currentColor.g = lerp(startColor.g, targetColor.g, eased);
+      currentColor.b = lerp(startColor.b, targetColor.b, eased);
+
+      currentSecondary.r = lerp(startSecondary.r, targetSecondary.r, eased);
+      currentSecondary.g = lerp(startSecondary.g, targetSecondary.g, eased);
+      currentSecondary.b = lerp(startSecondary.b, targetSecondary.b, eased);
+
+      if (t >= 1.0) {
+        isTransitioning = false;
+        currentColor.r = targetColor.r;
+        currentColor.g = targetColor.g;
+        currentColor.b = targetColor.b;
+        currentSecondary.r = targetSecondary.r;
+        currentSecondary.g = targetSecondary.g;
+        currentSecondary.b = targetSecondary.b;
+      }
+    }
+
+    var p = applyAdjustments(currentColor);
+    var s = applyAdjustments(currentSecondary);
+    var activeMode = (typeof mode !== "undefined") ? mode : "Solid Dominant";
+    var animSpeed = (typeof breathe_speed !== "undefined") ? breathe_speed / 35.0 : 1.0;
+    var secTime = (now * 0.001) * animSpeed;
+
+    // 2. Render Selected Display Mode
+    if (activeMode === "Solid Dominant") {
+      ctx.fillStyle = "rgb(" + p.r + "," + p.g + "," + p.b + ")";
+      ctx.fillRect(0, 0, width, height);
+
+    } else if (activeMode === "Horizontal Gradient") {
+      var grad = ctx.createLinearGradient(0, 0, width, 0);
+      grad.addColorStop(0, "rgb(" + p.r + "," + p.g + "," + p.b + ")");
+      grad.addColorStop(1, "rgb(" + s.r + "," + s.g + "," + s.b + ")");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, width, height);
+
+    } else if (activeMode === "Vertical Gradient") {
+      var gradV = ctx.createLinearGradient(0, 0, 0, height);
+      gradV.addColorStop(0, "rgb(" + p.r + "," + p.g + "," + p.b + ")");
+      gradV.addColorStop(1, "rgb(" + s.r + "," + s.g + "," + s.b + ")");
+      ctx.fillStyle = gradV;
+      ctx.fillRect(0, 0, width, height);
+
+    } else if (activeMode === "Diagonal Flow") {
+      var gradD = ctx.createLinearGradient(0, 0, width, height);
+      gradD.addColorStop(0, "rgb(" + p.r + "," + p.g + "," + p.b + ")");
+      gradD.addColorStop(1, "rgb(" + s.r + "," + s.g + "," + s.b + ")");
+      ctx.fillStyle = gradD;
+      ctx.fillRect(0, 0, width, height);
+
+    } else if (activeMode === "Radial Gradient") {
+      var radGrad = ctx.createRadialGradient(width / 2, height / 2, 10, width / 2, height / 2, width * 0.7);
+      radGrad.addColorStop(0, "rgb(" + p.r + "," + p.g + "," + p.b + ")");
+      radGrad.addColorStop(1, "rgb(" + s.r + "," + s.g + "," + s.b + ")");
+      ctx.fillStyle = radGrad;
+      ctx.fillRect(0, 0, width, height);
+
+    } else if (activeMode === "Breathing Ambient") {
+      var breathAlpha = 0.35 + 0.65 * (Math.sin(secTime * 2.0) * 0.5 + 0.5);
+      ctx.fillStyle = "rgba(" + p.r + "," + p.g + "," + p.b + "," + breathAlpha + ")";
+      ctx.fillRect(0, 0, width, height);
+
+    } else if (activeMode === "Dual Breathe") {
+      var blendFactor = Math.sin(secTime * 1.5) * 0.5 + 0.5;
+      var curR = Math.round(lerp(p.r, s.r, blendFactor));
+      var curG = Math.round(lerp(p.g, s.g, blendFactor));
+      var curB = Math.round(lerp(p.b, s.b, blendFactor));
+      ctx.fillStyle = "rgb(" + curR + "," + curG + "," + curB + ")";
+      ctx.fillRect(0, 0, width, height);
+
+    } else if (activeMode === "Color Wave") {
+      var waveGrad = ctx.createLinearGradient(0, 0, width, 0);
+      var phase = (secTime * 0.5) % 1.0;
+      var pos1 = phase;
+      var pos2 = (phase + 0.5) % 1.0;
+
+      if (pos1 < pos2) {
+        waveGrad.addColorStop(0, "rgb(" + p.r + "," + p.g + "," + p.b + ")");
+        waveGrad.addColorStop(pos1, "rgb(" + s.r + "," + s.g + "," + s.b + ")");
+        waveGrad.addColorStop(pos2, "rgb(" + p.r + "," + p.g + "," + p.b + ")");
+        waveGrad.addColorStop(1, "rgb(" + s.r + "," + s.g + "," + s.b + ")");
+      } else {
+        waveGrad.addColorStop(0, "rgb(" + s.r + "," + s.g + "," + s.b + ")");
+        waveGrad.addColorStop(pos2, "rgb(" + p.r + "," + p.g + "," + p.b + ")");
+        waveGrad.addColorStop(pos1, "rgb(" + s.r + "," + s.g + "," + s.b + ")");
+        waveGrad.addColorStop(1, "rgb(" + p.r + "," + p.g + "," + p.b + ")");
+      }
+      ctx.fillStyle = waveGrad;
+      ctx.fillRect(0, 0, width, height);
+
+    } else if (activeMode === "Ambient Drift") {
+      ctx.fillStyle = "rgb(" + s.r + "," + s.g + "," + s.b + ")";
+      ctx.fillRect(0, 0, width, height);
+
+      var orbX = width * 0.5 + Math.cos(secTime * 0.8) * (width * 0.35);
+      var orbY = height * 0.5 + Math.sin(secTime * 0.6) * (height * 0.35);
+
+      var driftGrad = ctx.createRadialGradient(orbX, orbY, 15, orbX, orbY, width * 0.65);
+      driftGrad.addColorStop(0, "rgba(" + p.r + "," + p.g + "," + p.b + ", 1.0)");
+      driftGrad.addColorStop(1, "rgba(" + p.r + "," + p.g + "," + p.b + ", 0.0)");
+      ctx.fillStyle = driftGrad;
+      ctx.fillRect(0, 0, width, height);
+    }
+
+    window.requestAnimationFrame(render);
+  }
+
+  window.requestAnimationFrame(render);
+</script>

@@ -1,0 +1,4 @@
+/target/
+Effects/WallpaperSync/target/
+*.log
+*.tmp

@@ -1,0 +1,11 @@
+[package]
+name = "signalrgb-wallpaper-sync"
+version = "0.1.0"
+edition = "2021"
+authors = ["Gourav Kumar"]
+description = "Syncs desktop wallpaper slideshow colors to SignalRGB in real time"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1.0", features = ["derive"] }
+ureq = { version = "2.10", default-features = false }
