@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use image::imageops::FilterType;
 use image::GenericImageView;
 use serde::Serialize;
@@ -13,6 +15,70 @@ use std::time::{Duration, SystemTime};
 const SIGNALRGB_EVENT_PORT: u16 = 16034;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(windows)]
+mod win_console {
+    extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> usize;
+        fn WriteConsoleW(
+            h_console_output: usize,
+            lp_buffer: *const u16,
+            n_number_of_chars_to_write: u32,
+            lp_number_of_chars_written: *mut u32,
+            lp_reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+
+    static mut CONSOLE_ATTACHED: bool = false;
+
+    pub fn attach_parent() {
+        unsafe {
+            if AttachConsole(0xFFFFFFFF) != 0 {
+                CONSOLE_ATTACHED = true;
+            }
+        }
+    }
+
+    pub fn print_str(msg: &str) {
+        unsafe {
+            if CONSOLE_ATTACHED {
+                let h = GetStdHandle(STD_OUTPUT_HANDLE);
+                if h != 0 && h != usize::MAX {
+                    let utf16: Vec<u16> = msg.encode_utf16().collect();
+                    let mut written: u32 = 0;
+                    WriteConsoleW(h, utf16.as_ptr(), utf16.len() as u32, &mut written, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod win_console {
+    pub fn attach_parent() {}
+    pub fn print_str(msg: &str) {
+        print!("{}", msg);
+    }
+}
+
+macro_rules! cprintln {
+    ($($arg:tt)*) => {{
+        let s = format!($($arg)*) + "\r\n";
+        win_console::print_str(&s);
+        println!($($arg)*);
+    }};
+}
+
+macro_rules! ceprintln {
+    ($($arg:tt)*) => {{
+        let s = format!($($arg)*) + "\r\n";
+        win_console::print_str(&s);
+        eprintln!($($arg)*);
+    }};
+}
 
 #[cfg(windows)]
 mod win_mem {
@@ -550,79 +616,65 @@ fn spawn_daemon() -> bool {
 }
 
 fn cmd_install() {
-    println!("============================================================");
-    println!("  SignalRGB Wallpaper Sync - One-Click Installer");
-    println!("  Author: Gourav Kumar");
-    println!("============================================================");
+    cprintln!("============================================================");
+    cprintln!("  SignalRGB Wallpaper Sync - One-Click Installer");
+    cprintln!("  Author: Gourav Kumar");
+    cprintln!("============================================================");
 
     // 1. Install Effect HTML
     let effects_dir = get_signalrgb_effects_path();
     let _ = std::fs::create_dir_all(&effects_dir);
     let target_html = effects_dir.join("Wallpaper Sync.html");
     match std::fs::write(&target_html, EMBEDDED_EFFECT_HTML) {
-        Ok(_) => println!("[1/3] Installed 'Wallpaper Sync.html' into SignalRGB Effects library."),
-        Err(e) => eprintln!("[1/3] ERROR installing HTML effect: {}", e),
+        Ok(_) => cprintln!("[1/3] Installed 'Wallpaper Sync.html' into SignalRGB Effects library."),
+        Err(e) => ceprintln!("[1/3] ERROR installing HTML effect: {}", e),
     }
 
-    // 2. Configure Windows Startup Shortcut
+    // 2. Configure Windows Run Registry (clean, single, silent autostart alongside SignalRGB)
     let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("signalrgb-wallpaper-sync.exe"));
-    let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
-    let shortcut_cmd = format!(
-        "$wsh = New-Object -ComObject WScript.Shell; \
-         $startup = [System.Environment]::GetFolderPath('Startup'); \
-         $lnk = $wsh.CreateShortcut((Join-Path $startup 'SignalRGB-Wallpaper-Sync.lnk')); \
-         $lnk.TargetPath = '{}'; \
-         $lnk.Arguments = '--daemon'; \
-         $lnk.WorkingDirectory = '{}'; \
-         $lnk.Description = 'SignalRGB Wallpaper Slideshow Sync'; \
-         $lnk.Save()",
-        exe_path.display(),
-        exe_dir.display()
-    );
-
-    let res = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &shortcut_cmd])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-
-    // Also register in HKCU\Software\Microsoft\Windows\CurrentVersion\Run alongside SignalRGB
     let reg_cmd = format!(
         "Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'SignalRGB-Wallpaper-Sync' -Value '\"{}\" --daemon'",
         exe_path.display()
     );
-    let _ = Command::new("powershell")
+    let res = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &reg_cmd])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
+    // Clean up any legacy Startup shortcut to ensure zero duplicate entries
+    let old_shortcut = get_startup_shortcut_path();
+    if old_shortcut.exists() {
+        let _ = std::fs::remove_file(old_shortcut);
+    }
+
     if res.is_ok() {
-        println!("[2/3] Configured Windows Startup & Run registry (runs silently on boot alongside SignalRGB).");
+        cprintln!("[2/3] Configured Windows Autostart (starts silently on boot alongside SignalRGB).");
     } else {
-        eprintln!("[2/3] WARNING: Could not register Windows Startup automatically.");
+        ceprintln!("[2/3] WARNING: Could not register Windows Autostart automatically.");
     }
 
     // 3. Start background daemon
     kill_other_instances();
     sleep(Duration::from_millis(400));
     if spawn_daemon() {
-        println!("[3/3] Started background sync daemon.");
+        cprintln!("[3/3] Started background sync daemon.");
     } else {
-        eprintln!("[3/3] Could not spawn background daemon.");
+        ceprintln!("[3/3] Could not spawn background daemon.");
     }
 
-    println!("\nSUCCESS: SignalRGB Wallpaper Sync is installed and active!");
-    println!("Open SignalRGB -> Lighting -> My Effects -> select 'Wallpaper Sync'.");
+    cprintln!("\nSUCCESS: SignalRGB Wallpaper Sync is installed and active!");
+    cprintln!("Open SignalRGB -> Lighting -> My Effects -> select 'Wallpaper Sync'.");
 }
 
 fn cmd_uninstall() {
-    println!("Uninstalling SignalRGB Wallpaper Sync...");
+    cprintln!("Uninstalling SignalRGB Wallpaper Sync...");
     kill_other_instances();
-    println!("[OK] Stopped background sync daemon.");
+    cprintln!("[OK] Stopped background sync daemon.");
 
     let shortcut = get_startup_shortcut_path();
     if shortcut.exists() {
         let _ = std::fs::remove_file(shortcut);
-        println!("[OK] Removed Windows Startup shortcut.");
+        cprintln!("[OK] Removed Windows Startup shortcut.");
     }
 
     let unreg_cmd = "Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'SignalRGB-Wallpaper-Sync' -ErrorAction SilentlyContinue";
@@ -630,32 +682,31 @@ fn cmd_uninstall() {
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", unreg_cmd])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
-    println!("[OK] Removed Windows Run registry entry.");
+    cprintln!("[OK] Removed Windows Run registry entry.");
 
-    println!("Uninstallation complete.");
+    cprintln!("Uninstallation complete.");
 }
 
 fn cmd_start() {
     if is_other_instance_running() {
-        println!("SignalRGB Wallpaper Sync daemon is already running.");
+        cprintln!("SignalRGB Wallpaper Sync daemon is already running.");
         return;
     }
     if spawn_daemon() {
-        println!("[OK] Started background sync daemon.");
+        cprintln!("[OK] Started background sync daemon.");
     } else {
-        eprintln!("[ERROR] Could not start background sync daemon.");
+        ceprintln!("[ERROR] Could not start background sync daemon.");
     }
 }
 
 fn cmd_stop() {
     kill_other_instances();
-    println!("[OK] Stopped all background sync instances.");
+    cprintln!("[OK] Stopped all background sync instances.");
 }
 
 fn cmd_status() {
     let running = is_other_instance_running();
     let effect_installed = get_signalrgb_effects_path().join("Wallpaper Sync.html").exists();
-    let startup_configured = get_startup_shortcut_path().exists();
 
     let reg_check_cmd = "(Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'SignalRGB-Wallpaper-Sync' -ErrorAction SilentlyContinue) -ne $null";
     let reg_configured = Command::new("powershell")
@@ -665,28 +716,27 @@ fn cmd_status() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "True")
         .unwrap_or(false);
 
-    println!("SignalRGB Wallpaper Sync Status:");
-    println!("  Background Daemon Running : {}", if running { "YES" } else { "NO" });
-    println!("  SignalRGB Effect Installed: {}", if effect_installed { "YES" } else { "NO" });
-    println!("  Windows Startup Shortcut  : {}", if startup_configured { "YES" } else { "NO" });
-    println!("  Windows Registry Autostart: {}", if reg_configured { "YES" } else { "NO" });
+    cprintln!("SignalRGB Wallpaper Sync Status:");
+    cprintln!("  Background Daemon Running : {}", if running { "YES" } else { "NO" });
+    cprintln!("  SignalRGB Effect Installed: {}", if effect_installed { "YES" } else { "NO" });
+    cprintln!("  Windows Autostart Enabled : {}", if reg_configured { "YES" } else { "NO" });
 }
 
 fn print_help() {
-    println!("SignalRGB Wallpaper Slideshow Sync v1.0.0");
-    println!("Author: Gourav Kumar\n");
-    println!("USAGE:");
-    println!("  signalrgb-wallpaper-sync.exe [COMMAND]\n");
-    println!("COMMANDS:");
-    println!("  (no args)     Run interactively with real-time console logs");
-    println!("  --install     One-click install: embeds effect, registers Windows startup, and starts service");
-    println!("  --uninstall   Removes Windows startup registration and stops service");
-    println!("  --start       Starts the sync service silently in the background (zero window)");
-    println!("  --stop        Stops the running background service");
-    println!("  --status      Checks if the background service is active");
-    println!("  --daemon      Internal headless background worker (persistent)");
-    println!("  --companion   Headless background worker that auto-exits when SignalRGB closes");
-    println!("  --help, -h    Displays this help menu");
+    cprintln!("SignalRGB Wallpaper Slideshow Sync v1.0.0");
+    cprintln!("Author: Gourav Kumar\n");
+    cprintln!("USAGE:");
+    cprintln!("  signalrgb-wallpaper-sync.exe [COMMAND]\n");
+    cprintln!("COMMANDS:");
+    cprintln!("  (no args)     Run interactively with real-time console logs");
+    cprintln!("  --install     One-click install: embeds effect, registers Windows startup, and starts service");
+    cprintln!("  --uninstall   Removes Windows startup registration and stops service");
+    cprintln!("  --start       Starts the sync service silently in the background (zero window)");
+    cprintln!("  --stop        Stops the running background service");
+    cprintln!("  --status      Checks if the background service is active");
+    cprintln!("  --daemon      Internal headless background worker (persistent)");
+    cprintln!("  --companion   Headless background worker that auto-exits when SignalRGB closes");
+    cprintln!("  --help, -h    Displays this help menu");
 }
 
 // -------------------------------------------------------------
@@ -695,10 +745,10 @@ fn print_help() {
 
 fn run_sync_loop(is_daemon: bool, is_companion: bool) {
     if !is_daemon {
-        println!("============================================================");
-        println!("  SignalRGB Wallpaper Slideshow Sync (Perceptual AI) v1.0.0");
-        println!("  Author: Gourav Kumar");
-        println!("============================================================");
+        cprintln!("============================================================");
+        cprintln!("  SignalRGB Wallpaper Slideshow Sync (Perceptual AI) v1.0.0");
+        cprintln!("  Author: Gourav Kumar");
+        cprintln!("============================================================");
     }
 
     let mut last_sig: Option<WallpaperSignature> = None;
@@ -740,7 +790,7 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
             was_srgb_active = true;
             last_sig = None;
             if !is_daemon {
-                println!("[SignalRGB Connected] SignalRGB detected! Synchronizing wallpaper colors immediately...");
+                cprintln!("[SignalRGB Connected] SignalRGB detected! Synchronizing wallpaper colors immediately...");
             }
         }
 
@@ -768,13 +818,13 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
                                 let p = colors.primary;
                                 let s = colors.secondary;
                                 if !is_daemon {
-                                    println!("\n[Wallpaper Changed] Detected new slideshow frame!");
-                                    println!("  -> Source File    : {}", sig.path.display());
-                                    println!(
+                                    cprintln!("\n[Wallpaper Changed] Detected new slideshow frame!");
+                                    cprintln!("  -> Source File    : {}", sig.path.display());
+                                    cprintln!(
                                         "  -> Primary Color  : [{}] RGB({:>3}, {:>3}, {:>3})  #{:02x}{:02x}{:02x}",
                                         colors.primary_name, p.r, p.g, p.b, p.r, p.g, p.b
                                     );
-                                    println!(
+                                    cprintln!(
                                         "  -> Secondary Color: [{}] RGB({:>3}, {:>3}, {:>3})  #{:02x}{:02x}{:02x}",
                                         colors.secondary_name, s.r, s.g, s.b, s.r, s.g, s.b
                                     );
@@ -783,7 +833,7 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
                                 match send_to_signalrgb(&colors) {
                                     Ok(_) => {
                                         if !is_daemon {
-                                            println!("  [OK] Pushed vibrant colors to SignalRGB port {}", SIGNALRGB_EVENT_PORT);
+                                            cprintln!("  [OK] Pushed vibrant colors to SignalRGB port {}", SIGNALRGB_EVENT_PORT);
                                         }
                                         last_primary = Some(colors.primary);
                                         last_secondary = Some(colors.secondary);
@@ -793,7 +843,7 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
                                     }
                                     Err(e) => {
                                         if !is_daemon {
-                                            eprintln!("  [WARN] Could not send to SignalRGB (is SignalRGB open?): {}", e);
+                                            ceprintln!("  [WARN] Could not send to SignalRGB (is SignalRGB open?): {}", e);
                                         }
                                     }
                                 }
@@ -809,13 +859,13 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
                         }
                         Err(e) => {
                             if !is_daemon {
-                                eprintln!("[ERROR] Extracting colors failed: {}", e);
+                                ceprintln!("[ERROR] Extracting colors failed: {}", e);
                             }
                         }
                     },
                     Err(e) => {
                         if !is_daemon {
-                            eprintln!("[ERROR] Reading wallpaper file failed: {}", e);
+                            ceprintln!("[ERROR] Reading wallpaper file failed: {}", e);
                         }
                     }
                 }
@@ -837,6 +887,11 @@ fn run_sync_loop(is_daemon: bool, is_companion: bool) {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    let is_headless = args.len() > 1 && (args[1] == "--daemon" || args[1] == "--companion");
+    if !is_headless {
+        win_console::attach_parent();
+    }
+
     if args.len() > 1 {
         match args[1].as_str() {
             "--install" => {
